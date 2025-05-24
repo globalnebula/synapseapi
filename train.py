@@ -5,7 +5,7 @@ from typing import List, Dict, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from model import PhishingDetector
+from model import PhishingDetector, PhishingScoreFusion
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -214,7 +214,7 @@ async def process_urls(urls: List[Dict]) -> List[Dict]:
     for url_data in tqdm(urls):
         try:
             # Get URL metadata
-            metadata = await scrape_url(url_data['url'], check_threat_intel=True, use_graph_model=False)
+            metadata = await scrape_url(url_data['url'], check_threat_intel=True)
             
             # Add to processed data
             processed_data.append({
@@ -224,6 +224,15 @@ async def process_urls(urls: List[Dict]) -> List[Dict]:
             
         except Exception as e:
             logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
+            # Add the URL data even if metadata extraction fails
+            processed_data.append({
+                **url_data,
+                'metadata': None
+            })
+    
+    if not processed_data:
+        logger.error("No URLs were successfully processed!")
+        raise ValueError("No valid data available for training")
     
     return processed_data
 
@@ -234,8 +243,18 @@ def build_knowledge_graph(data: List[Dict], output_path: str):
     
     # Add domain connections
     for entry in data:
-        if 'metadata' in entry and 'domain_info' in entry['metadata']:
-            domain = entry['metadata']['domain_info']['domain']
+        try:
+            # Skip if metadata is None
+            if not entry.get('metadata'):
+                continue
+                
+            domain_info = entry['metadata'].get('domain_info', {})
+            if not domain_info:
+                continue
+                
+            domain = domain_info.get('domain')
+            if not domain:
+                continue
             
             # Add domain node if not exists
             if domain not in graph:
@@ -244,6 +263,10 @@ def build_knowledge_graph(data: List[Dict], output_path: str):
             # Add connections based on target
             if entry.get('target') and entry['target'] != 'benign':
                 graph.add_edge(domain, entry['target'], type='targets')
+                
+        except Exception as e:
+            logger.error(f"Error processing entry for knowledge graph: {str(e)}")
+            continue
     
     # Save graph
     try:
@@ -264,43 +287,81 @@ def train_model(
     """Train the phishing detection model with early stopping."""
     logger.info("Training model...")
     
-    # Initialize detector
+    # Initialize detector and fusion model
     detector = PhishingDetector()
+    fusion_model = PhishingScoreFusion(
+        gnn_dim=4,  # Match input feature dimension
+        llm_dim=256,
+        hidden_dim=256,
+        dropout=0.1,
+        temporal_decay=0.1
+    )
+    
     early_stopping = EarlyStopping(patience=early_stopping_patience)
     
-    # Set up optimizer
-    optimizer = torch.optim.Adam(detector.model.parameters(), lr=lr)
+    # Set up optimizers
+    detector_optimizer = torch.optim.Adam(detector.model.parameters(), lr=lr)
+    fusion_optimizer = torch.optim.Adam(fusion_model.parameters(), lr=lr)
     
     # Training loop
     for epoch in range(epochs):
         detector.model.train()
+        fusion_model.train()
         total_loss = 0
+        processed_samples = 0
         
         # Process training data
         for url_data in tqdm(train_data, desc=f"Epoch {epoch + 1}/{epochs}"):
             try:
-                # Preprocess URL
-                x, edge_index, edge_attr = detector.preprocess_url(url_data)
+                # Skip if metadata is None
+                if url_data.get('metadata') is None:
+                    continue
+                
+                # Get GNN output
+                gnn_output = detector.preprocess_url(url_data)
+                
+                # Get LLM output (placeholder - replace with actual LLM output)
+                llm_output = {
+                    'embeddings': torch.randn(128, 256),  # Match GNN output dimensions
+                    'attention_mask': torch.ones(128, 128)
+                }
+                
+                # Prepare metadata
+                metadata = {
+                    'timestamps': [url_data.get('verified_at', datetime.now().isoformat())]
+                }
                 
                 # Get target
                 target = torch.tensor([1.0 if url_data['is_phishing'] else 0.0])
                 
-                # Forward pass
-                output = detector.model(x, edge_index, edge_attr)
-                loss = torch.nn.functional.cross_entropy(output, target)
+                # Forward pass through fusion model
+                fusion_output = fusion_model(gnn_output, llm_output, metadata)
+                final_score = fusion_output['final_score']
+                
+                # Calculate loss
+                loss = torch.nn.functional.binary_cross_entropy(final_score, target)
                 
                 # Backward pass
-                optimizer.zero_grad()
+                detector_optimizer.zero_grad()
+                fusion_optimizer.zero_grad()
                 loss.backward()
-                optimizer.step()
+                detector_optimizer.step()
+                fusion_optimizer.step()
                 
                 total_loss += loss.item()
+                processed_samples += 1
+                
             except Exception as e:
                 logger.error(f"Error processing URL {url_data.get('url', 'unknown')}: {str(e)}")
                 continue
         
+        if processed_samples == 0:
+            logger.error("No valid samples processed in this epoch!")
+            continue
+        
         # Validation
         detector.model.eval()
+        fusion_model.eval()
         val_loss = 0
         correct = 0
         total = 0
@@ -308,41 +369,72 @@ def train_model(
         with torch.no_grad():
             for url_data in val_data:
                 try:
-                    # Preprocess URL
-                    x, edge_index, edge_attr = detector.preprocess_url(url_data)
+                    # Skip if metadata is None
+                    if url_data.get('metadata') is None:
+                        continue
+                    
+                    # Get GNN output
+                    gnn_output = detector.preprocess_url(url_data)
+                    
+                    # Get LLM output
+                    llm_output = {
+                        'embeddings': torch.randn(128, 256),  # Match GNN output dimensions
+                        'attention_mask': torch.ones(128, 128)
+                    }
+                    
+                    # Prepare metadata
+                    metadata = {
+                        'timestamps': [url_data.get('verified_at', datetime.now().isoformat())]
+                    }
                     
                     # Get target
                     target = torch.tensor([1.0 if url_data['is_phishing'] else 0.0])
                     
                     # Forward pass
-                    output = detector.model(x, edge_index, edge_attr)
-                    loss = torch.nn.functional.cross_entropy(output, target)
+                    fusion_output = fusion_model(gnn_output, llm_output, metadata)
+                    final_score = fusion_output['final_score']
+                    
+                    # Calculate loss
+                    loss = torch.nn.functional.binary_cross_entropy(final_score, target)
                     val_loss += loss.item()
                     
                     # Get predictions
-                    pred = output.argmax(dim=1)
+                    pred = (final_score > 0.5).float()
                     correct += (pred == target).sum().item()
                     total += 1
+                    
                 except Exception as e:
                     logger.error(f"Error validating URL {url_data.get('url', 'unknown')}: {str(e)}")
                     continue
         
+        if total == 0:
+            logger.error("No valid samples in validation set!")
+            continue
+        
         # Calculate metrics
-        avg_train_loss = total_loss / len(train_data)
-        avg_val_loss = val_loss / len(val_data)
-        val_accuracy = correct / total if total > 0 else 0
+        avg_train_loss = total_loss / processed_samples
+        avg_val_loss = val_loss / total
+        val_accuracy = correct / total
         
         # Log progress
         logger.info(
             f"Epoch {epoch + 1}/{epochs} | "
             f"Train Loss: {avg_train_loss:.4f} | "
             f"Val Loss: {avg_val_loss:.4f} | "
-            f"Val Acc: {val_accuracy:.4f}"
+            f"Val Acc: {val_accuracy:.4f} | "
+            f"Processed Samples: {processed_samples}/{len(train_data)}"
         )
         
         # Save checkpoint
         checkpoint_path = f"{model_path}.checkpoint"
-        detector.save_model(checkpoint_path)
+        torch.save({
+            'detector_state_dict': detector.model.state_dict(),
+            'fusion_state_dict': fusion_model.state_dict(),
+            'detector_optimizer': detector_optimizer.state_dict(),
+            'fusion_optimizer': fusion_optimizer.state_dict(),
+            'epoch': epoch,
+            'val_loss': avg_val_loss
+        }, checkpoint_path)
         logger.info(f"Saved checkpoint to {checkpoint_path}")
         
         # Early stopping check
@@ -353,8 +445,56 @@ def train_model(
             break
     
     # Save final model
-    detector.save_model(model_path)
+    torch.save({
+        'detector_state_dict': detector.model.state_dict(),
+        'fusion_state_dict': fusion_model.state_dict()
+    }, model_path)
     logger.info(f"Saved final model to {model_path}")
+
+def sample_balanced_dataset(data: List[Dict], max_samples: int = 5000) -> List[Dict]:
+    """
+    Sample a balanced subset of the dataset, ensuring good representation of different types.
+    
+    Args:
+        data: List of URL data dictionaries
+        max_samples: Maximum number of samples to return (default: 5000)
+    
+    Returns:
+        List of sampled URL data dictionaries
+    """
+    logger.info(f"Sampling balanced dataset from {len(data)} URLs...")
+    
+    # Group URLs by target
+    target_groups = {}
+    for entry in data:
+        target = entry.get('target', 'unknown')
+        if target not in target_groups:
+            target_groups[target] = []
+        target_groups[target].append(entry)
+    
+    # Calculate samples per target
+    samples_per_target = max_samples // len(target_groups)
+    sampled_data = []
+    
+    # Sample from each target group
+    for target, urls in target_groups.items():
+        if len(urls) > samples_per_target:
+            # If we have more URLs than needed, sample intelligently
+            # Prioritize recently verified URLs
+            sorted_urls = sorted(urls, key=lambda x: x.get('verified_at', ''), reverse=True)
+            sampled_urls = sorted_urls[:samples_per_target]
+        else:
+            # If we have fewer URLs than needed, use all of them
+            sampled_urls = urls
+        
+        sampled_data.extend(sampled_urls)
+        logger.info(f"Sampled {len(sampled_urls)} URLs for target '{target}'")
+    
+    # Shuffle the sampled data
+    random.shuffle(sampled_data)
+    
+    logger.info(f"Final sampled dataset size: {len(sampled_data)} URLs")
+    return sampled_data
 
 async def main():
     # Create directories if they don't exist
@@ -365,46 +505,62 @@ async def main():
     phishing_data = []
     
     # Try loading from PhishTank public datasets
-    phishing_data.extend(load_phishtank_public_data())
-    phishing_data.extend(load_phishtank_public_json())
+    phishtank_data = []
+    phishtank_data.extend(load_phishtank_public_data())
+    phishtank_data.extend(load_phishtank_public_json())
+    
+    # Sample a balanced subset from PhishTank data
+    if phishtank_data:
+        phishing_data.extend(sample_balanced_dataset(phishtank_data, max_samples=5000))
     
     # If we don't have enough data, generate synthetic data
     if len(phishing_data) < 1000:
         synthetic_data = generate_synthetic_phishing_urls(limit=1000 - len(phishing_data))
         phishing_data.extend(synthetic_data)
     
-    # Load benign URLs
+    # Load benign URLs - match the number of phishing URLs
     benign_data = load_benign_urls(limit=len(phishing_data))
     
     # Combine and shuffle data
     all_data = phishing_data + benign_data
     random.shuffle(all_data)
     
+    logger.info(f"Total dataset size: {len(all_data)} URLs ({len(phishing_data)} phishing, {len(benign_data)} benign)")
+    
     # Process URLs
-    processed_data = await process_urls(all_data)
-    
-    # Split data
-    train_data, val_data = train_test_split(
-        processed_data,
-        test_size=0.2,
-        random_state=42
-    )
-    
-    # Build knowledge graph
-    build_knowledge_graph(
-        processed_data,
-        'data/knowledge_graph.graphml'
-    )
-    
-    # Train model with early stopping
-    train_model(
-        train_data=train_data,
-        val_data=val_data,
-        model_path='models/phishing_detector.pt',
-        epochs=100,
-        batch_size=32,
-        early_stopping_patience=5
-    )
+    try:
+        processed_data = await process_urls(all_data)
+        
+        if not processed_data:
+            raise ValueError("No data was successfully processed")
+        
+        # Split data
+        train_data, val_data = train_test_split(
+            processed_data,
+            test_size=0.2,
+            random_state=42
+        )
+        
+        logger.info(f"Training set size: {len(train_data)}, Validation set size: {len(val_data)}")
+        
+        # Build knowledge graph
+        build_knowledge_graph(
+            processed_data,
+            'data/knowledge_graph.graphml'
+        )
+        
+        # Train model with early stopping
+        train_model(
+            train_data=train_data,
+            val_data=val_data,
+            model_path='models/phishing_detector.pt',
+            epochs=100,
+            batch_size=32,
+            early_stopping_patience=5
+        )
+    except Exception as e:
+        logger.error(f"Error during training process: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main()) 

@@ -79,21 +79,33 @@ def get_ssl_cert_info(hostname: str) -> Optional[SSLCertInfo]:
                 
                 # Convert issuer and subject to dictionaries
                 issuer_dict = {}
-                for key, value in cert['issuer']:
-                    issuer_dict[key] = value
+                if isinstance(cert['issuer'], tuple):
+                    for key, value in cert['issuer']:
+                        issuer_dict[key] = value
+                else:
+                    # Handle single-item format
+                    issuer_dict = dict(cert['issuer'])
                 
                 subject_dict = {}
-                for key, value in cert['subject']:
-                    subject_dict[key] = value
+                if isinstance(cert['subject'], tuple):
+                    for key, value in cert['subject']:
+                        subject_dict[key] = value
+                else:
+                    # Handle single-item format
+                    subject_dict = dict(cert['subject'])
+                
+                # Parse dates
+                not_before = datetime.strptime(cert['notBefore'], '%b %d %H:%M:%S %Y %Z')
+                not_after = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                 
                 return SSLCertInfo(
                     issuer=issuer_dict,
                     subject=subject_dict,
                     version=cert['version'],
-                    not_before=cert['notBefore'],
-                    not_after=cert['notAfter'],
+                    not_before=not_before.isoformat(),
+                    not_after=not_after.isoformat(),
                     serial_number=hex(cert['serialNumber']),
-                    is_valid=datetime.now() < datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                    is_valid=datetime.now() < not_after
                 )
     except Exception as e:
         logger.error(f"Error getting SSL cert info: {str(e)}")
